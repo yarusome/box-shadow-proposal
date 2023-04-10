@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Radius expansion algorithms</title>
+<style>body {
+  display: flex;
+  height: 100vh;
+  margin: 0;
+}
+#output {
+  flex: 1;
+  border-left: 1px solid;
+  margin-left: 1em;
+  overflow: auto;
+}
+#output, form {
+  padding: 1em;
+}
+label {
+  display: flex;
+  width: max-content;
+  margin: 0.5em 0;
+}
+article {
+  padding: 1em;
+}
+input:not([type]) {
+  font: 100%/1.5 Consolas, Monaco, monospace;
+  width: 80ch;
+  margin-bottom: 0.5em;
+}</style>
+</head>
+<body>
+<form>
+  <label>
+    <input type="radio" name="algorithm" value="do-not-polyfill" checked>
+    Do not polyfill
+  </label>
+  <label>
+    <input type="radio" name="algorithm" value="increase-by-spread">
+    Increase radius by spread
+  </label>
+  <label>
+    <input type="radio" name="algorithm" value="old-spec">
+    Old spec (discontinuous)
+  </label>
+  <label>
+    <input type="radio" name="algorithm" value="current-spec">
+    Current spec
+  </label>
+  <label>
+    <input type="radio" name="algorithm" value="percentage-same-axis">
+    Percentage of same axis
+  </label>
+  <label>
+    <input type="radio" name="algorithm" value="elika">
+    Elika’s Interpolation based on rounded/straight ratio
+  </label>
+  <label>
+    <input type="radio" name="algorithm" value="oriol">
+    Oriol's variant of current spec
+  </label>
+  <label>
+    <input type="radio" name="algorithm" value="geo-mean">
+    Geometric mean
+  </label>
+  <label>
+    <input type="radio" name="algorithm" value="geo-mean-elliptic-1">
+    Geometric mean + elliptic correction 1
+  </label>
+  <label>
+    <input type="radio" name="algorithm" value="geo-mean-elliptic-2">
+    Geometric mean + elliptic correction 2
+  </label>
+</form>
+<output id="output"></output>
+<script>
+const {algorithm} = document.forms[0].elements;
+const testCases = [
+  {width: 50, height: 50, spread: 50, borderRadius: "0px"},
+  {width: 50, height: 50, spread: 50, borderRadius: "1px"},
+  {width: 10, height: 10, spread: 70, borderRadius: "100%"},
+  {width: 200, height: 40, spread: 50, borderRadius: "100px / 20px"},
+  {width: 200, height: 40, spread: 50, borderRadius: "20px / 4px"},
+  {width: 500, height: 50, spread: 30, borderRadius: "15px"},
+  {width: 500, height: 50, spread: 30, borderRadius: "25px"},
+  {width: 500, height: 60, spread: 30, borderRadius: "20px 20px 40px 40px"},
+  {width: 500, height: 50, spread: 30, borderRadius: "1px 1px 49px 49px"},
+  {width: 500, height: 60, spread: 30, borderRadius: "0px 0px 30px 30px"},
+  {width: 250, height: 35, spread: 50, borderRadius: "0px 0px 25px 25px"},
+  {width: 500, height: 50, spread: 30, borderRadius: "50%"},
+  {width: 500, height: 50, spread: 30, borderRadius: "50% 50% 1px 50%"},
+  {width: 200, height: 40, spread: 50, borderRadius: "0 100% 0 100%"},
+  {width: 200, height: 40, spread: 50, borderRadius: "10% 90% / 5%"},
+  {width: 200, height: 40, spread: 50, borderRadius: "0 50% / 50%"},
+  {width: 0, height: 0, spread: 30, borderRadius: "50px 0px 0px 0px"},
+  {width: 500, height: 500, spread: 30, borderRadius: "50px"},
+];
+function show({incremental = false} = {}) {
+  for (let i = 0, testCase; testCase = testCases[i]; i++) {
+    let container = output.children[i];
+    if (!container) {
+      container = document.createElement("article");
+      container.id = `testcase${i}`;
+      output.appendChild(container);
+    }
+    if (!incremental) {
+      let input = document.createElement("input");
+      input.value = JSON.stringify(testCase);
+      input.oninput = () => {
+        try {
+          testCases[i] = JSON.parse(input.value);
+          show({incremental: true});
+        }
+        catch (e) {}
+      };
+      container.append(input);
+    }
+    Array.from(container.querySelectorAll("div")).forEach(e => e.remove());
+    const inner = document.createElement("div");
+    inner.style.width = testCase.width + "px";
+    inner.style.height = testCase.height + "px";
+    inner.style.borderRadius = testCase.borderRadius;
+    inner.style.backgroundColor = "#fff";
+    const outer = document.createElement("div");
+    outer.appendChild(inner);
+    if (algorithm.value === "do-not-polyfill") {
+      inner.style.boxShadow = `0 0 0 ${testCase.spread}px #000`;
+      outer.style.padding = testCase.spread + "px";
+      container.appendChild(outer);
+    }
+    else {
+      outer.style.backgroundColor = "#000";
+      outer.style.borderStyle = "solid";
+      outer.style.borderWidth = testCase.spread + "px";
+      outer.style.width = "max-content";
+      container.appendChild(outer);
+      outer.style.borderRadius = resolve(testCase, inner);
+      if (!outer.style.borderRadius) {
+        outer.style.outline = "solid red";
+      }
+    }
+  }
+}
+function parseCorner(value, testCase) {
+  const raw = value.split(" ");
+  if (raw.length === 1) {
+    raw[1] = raw[0];
+  }
+  return [
+    parseLength(raw[0], testCase.width),
+    parseLength(raw[1], testCase.height),
+  ];
+}
+function parseLength(value, percentageBasis) {
+  if (value.endsWith("%")) {
+    return parseFloat(value) * percentageBasis / 100;
+  }
+  return parseFloat(value);
+}
+function resolve(testCase, box) {
+  const cs = getComputedStyle(box);
+  // Corners to array[2] of radii
+  const radii = {
+    topLeft: parseCorner(cs.borderTopLeftRadius, testCase),
+    topRight: parseCorner(cs.borderTopRightRadius, testCase),
+    bottomLeft: parseCorner(cs.borderBottomLeftRadius, testCase),
+    bottomRight: parseCorner(cs.borderBottomRightRadius, testCase),
+  };
+  // Normalize radii that add up to > 100%
+  let f = Math.min(
+    testCase.width / (radii.topLeft[0] + radii.topRight[0]),
+    testCase.width / (radii.bottomLeft[0] + radii.bottomRight[0]),
+    testCase.height / (radii.topLeft[1] + radii.bottomLeft[1]),
+    testCase.height / (radii.topRight[1] + radii.bottomRight[1])
+  );
+  if (Number.isNaN(f)) {
+    f = 0;
+  }
+  if (f < 1) {
+    for (let corner in radii) {
+      radii[corner] = radii[corner].map(v => v * f);
+    }
+  }
+  let r = {
+    topLeft: [],
+    topRight: [],
+    bottomLeft: [],
+    bottomRight: [],
+  };
+  const algorithm = document.forms[0].elements.algorithm.value;
+  let {width, height} = testCase;
+  let spreadWidth = width + testCase.spread * 2;
+  let spreadHeight = height + testCase.spread * 2;
+  let percentageSameAxis = {};
+  for (let corner in radii) {
+    let c = radii[corner];
+    let [rX, rY] = c;
+    let px = rX / width;
+    let py = rY / height;
+    percentageSameAxis[corner] = [px * spreadWidth, py * spreadHeight];
+  }
+  let currentSpec = {};
+  for (let corner in radii) {
+    currentSpec[corner] = radii[corner].map(value => {
+      if (value >= testCase.spread) {
+        return value + testCase.spread;
+      }
+      let r = value / testCase.spread;
+      return value + testCase.spread * (1 + (r - 1)**3);
+    });
+  }
+  switch (algorithm) {
+    case "increase-by-spread":
+      for (const corner in radii)
+        r[corner] = radii[corner].map(v => v + testCase.spread);
+      break;
+    case "old-spec":
+      for (const corner in radii) {
+        let c = radii[corner];
+        r[corner] = c[0] + c[1] === 0 ? [0, 0] : [c[0] + testCase.spread, c[1] + testCase.spread];
+      }
+      break;
+    case "percentage-same-axis":
+      r = percentageSameAxis;
+      break;
+    case "current-spec":
+      r = currentSpec;
+      break;
+    case "elika": {
+      let {width, height} = testCase;
+      let spreadWidth = width + testCase.spread * 2;
+      let spreadHeight = height + testCase.spread * 2;
+  
+      let straights = {
+        top: width - radii.topLeft[0] - radii.topRight[0],
+        bottom: width - radii.bottomLeft[0] - radii.bottomRight[0],
+        left: height - radii.topLeft[1] - radii.bottomLeft[1],
+        right: height - radii.topRight[1] - radii.bottomRight[1],
+      }
+  
+      function getStraightSegment(corner, axis) {
+        /*
+        Example straight segment returned:
+        topLeft, 0 --> top
+        topLeft, 1 --> left
+        bottomRight, 0 --> bottom
+        bottomRight, 1 --> right
+        */
+        let parts = corner.split(/(?=[A-Z])/).map(part => part.toLowerCase());
+        return straights[parts[axis]];
+      }
+  
+      for (const corner in radii)
+        r[corner] = radii[corner].map((value, axis) => {
+            let straight = getStraightSegment(corner, axis);
+            let ratio = Math.min(straight / value, 1);
+            let ret = ratio * currentSpec[corner][axis] + (1 - ratio) * percentageSameAxis[corner][axis];
+            
+            return Math.min(ret, straight + value + testCase.spread);
+          });
+      
+      break;
+    }
+    case "oriol":
+      for (const corner in radii) {
+       let coverage = Math.max(
+           2 * radii[corner][0] / testCase.width,
+           2 * radii[corner][1] / testCase.height
+         ) || 0;
+       r[corner] = radii[corner].map(value => {
+           if (value >= testCase.spread || coverage >= 1)
+             return value + testCase.spread;
+           let r = (1 - value / testCase.spread) * (1 - coverage);
+           return value + testCase.spread * (1 - r**3);
+         });
+      }
+      break;
+    case "geo-mean":
+    case "geo-mean-elliptic-1":
+    case "geo-mean-elliptic-2":
+      for (const corner in radii) {
+        let [rX, rY] = radii[corner];
+        let {spread} = testCase;
+        
+        // Compute the weighted geometric mean
+        if (spread > rX && spread > rY)
+          spread = Math.max(
+              rX * (((1 + spread / rX) / 2) ** Math.min(rX / testCase.width * 2, 1) * 2 - 1),
+              rY * (((1 + spread / rY) / 2) ** Math.min(rY / testCase.height * 2, 1) * 2 - 1)
+            );
+        if(!spread) {
+          r[corner] = [rX, rY];
+          continue;
+        }
+        
+        let RX = rX + spread, RY = rY + spread;
+        if(algorithm === "geo-mean") {
+          r[corner] = [RX, RY];
+          continue;
+        }
+        
+        // Prepare coefficients for the elliptic corrections
+        let r0 = Math.hypot(rX, rY);
+        let cX = (rX ** 2 / r0 + spread * Math.SQRT1_2) / RX,
+          cY = (rY ** 2 / r0 + spread * Math.SQRT1_2) / RY;
+        
+        if (algorithm === "geo-mean-elliptic-1") {
+          cX = 1 - cX; cY = 1 - cY;
+          let c = cX + cY + Math.sqrt(cX * cY * 2);
+          RX *= c, RY *= c;
+        }
+        else {
+          if(rX < rY)
+            RX *= (1 - cX) / (1 - Math.sqrt(1 - cY ** 2));
+          else
+            RY *= (1 - cY) / (1 - Math.sqrt(1 - cX ** 2));
+        }
+        r[corner] = [RX, RY];
+      }
+      break;
+  }
+  return `${r.topLeft[0]}px ${r.topRight[0]}px ${r.bottomRight[0]}px ${r.bottomLeft[0]}px / ${r.topLeft[1]}px ${r.topRight[1]}px ${r.bottomRight[1]}px ${r.bottomLeft[1]}px`;
+}
+show();
+document.querySelector("form").addEventListener("change", evt => show({incremental: true}));
+</script>
+</body>
+</html>
